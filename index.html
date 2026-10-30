@@ -15,8 +15,42 @@ function setConnection(t,ok){$('connLabel').textContent=t;$('dot').classList.tog
 function send(conn,msg){if(conn?.open)try{conn.send(msg)}catch(e){}}function broadcast(msg,except){clients.forEach((c,k)=>{if(k!==except)send(c.conn,msg)})}function snapshot(){return{type:'STATE',state,hostTime:Date.now()}}function updateState(next){state={...next};render();applyPlayer()}function hostAction(type,payload={}){const now=Date.now();let s={...state,queue:[...state.queue]};if(type==='EXPAND'){const i=s.queue.findIndex(t=>t.type==='playlist'&&t.id===payload.listId);if(i<0||!Array.isArray(payload.ids)||!payload.ids.length)return;const tracks=payload.ids.filter(v=>/^[a-zA-Z0-9_-]{11}$/.test(v)).slice(0,250).map((v,n)=>({type:'video',id:v,title:'Track '+(n+1)+' · '+v,playlistId:payload.listId}));if(!tracks.length)return;s.queue.splice(i,1,...tracks);if(s.index===i)s.index=i+Math.max(0,Math.min(tracks.length-1,Number(payload.activeIndex)||0));else if(s.index>i)s.index+=tracks.length-1;s.position=0;s.playing=true;}else if(type==='ADD'){s.queue.push(payload.track);if(s.queue.length===1){s.index=0;s.position=0;s.playing=true}}else if(type==='TOGGLE'){s.position=targetPos();s.playing=!s.playing}else if(type==='SEEK'){s.position=Math.max(0,Number(payload.position)||0)}else if(type==='NEXT'||type==='PREV'){if(!s.queue.length)return;s.index=(s.index+(type==='NEXT'?1:-1)+s.queue.length)%s.queue.length;s.position=0;s.playing=true}else if(type==='SELECT'){if(!s.queue[payload.index])return;s.index=payload.index;s.position=0;s.playing=true}else if(type==='MOVE'){const from=Number(payload.index),to=Number(payload.to);if(!Number.isInteger(from)||!Number.isInteger(to)||from<0||to<0||from>=s.queue.length||to>=s.queue.length||from===to)return;const [item]=s.queue.splice(from,1);s.queue.splice(to,0,item);if(s.index===from)s.index=to;else if(from<s.index&&to>=s.index)s.index--;else if(from>s.index&&to<=s.index)s.index++;s.position=targetPos()}else if(type==='REMOVE'){const i=Number(payload.index);if(!Number.isInteger(i)||i<0||i>=s.queue.length)return;const removingCurrent=i===s.index;s.queue.splice(i,1);if(!s.queue.length){s.index=0;s.position=0;s.playing=false;try{player?.stopVideo();if(player)player.__track=null}catch(e){}}else if(removingCurrent){s.index=Math.min(i,s.queue.length-1);s.position=0;s.playing=true}else{if(i<s.index)s.index--;s.position=targetPos()}}else if(type==='RESYNC'){s.position=targetPos()}else return;s.anchor=now;s.revision++;state=s;lastAction=now;broadcast(snapshot());render();applyPlayer()}
 function action(type,payload={}){if(host)hostAction(type,payload);else if(hostConn?.open)send(hostConn,{type:'ACTION',action:type,payload});else toast('Waiting for room connection')}
 function parseLink(input){let u;try{u=new URL(input.trim())}catch{return null}if(!/(^|\.)youtube\.com$|(^|\.)youtu\.be$/.test(u.hostname))return null;const list=u.searchParams.get('list');const v=u.hostname.endsWith('youtu.be')?u.pathname.slice(1):u.searchParams.get('v')||(u.pathname.startsWith('/shorts/')?u.pathname.split('/')[2]:null);if(list)return{type:'playlist',id:list,title:'Playlist · '+list.slice(0,12)};if(v&&/^[a-zA-Z0-9_-]{11}$/.test(v))return{type:'video',id:v,title:'Video · '+v};return null}
-function applyPlayer(){if(!playerReady||!current())return;const item=current();const key=item.type+':'+item.id;const newTrack=player.__track!==key;const p=targetPos();try{applying=true;if(newTrack){player.__track=key;if(item.type==='playlist'){player.cuePlaylist({listType:'playlist',list:item.id,index:0,startSeconds:p})}else player.cueVideoById({videoId:item.id,startSeconds:p})}if(state.playing){if(!newTrack&&player.getPlayerState()===YT.PlayerState.PLAYING&&Math.abs((player.getCurrentTime()||0)-p)>1.35)player.seekTo(p,true);player.playVideo()}else{if(!newTrack&&Math.abs((player.getCurrentTime()||0)-p)>0.55)player.seekTo(p,true);player.pauseVideo()}}catch(e){console.warn('Player error',e)}setTimeout(()=>{applying=false},700)}
+// Load a playing track immediately. cueVideoById only prepares it and can leave audio silent
+// until a second user interaction; do not call playVideo on every heartbeat.
+let lastPlayRequest=0;
+function applyPlayer(){
+  if(!playerReady||!current())return;
+  const item=current(),key=item.type+':'+item.id;
+  const newTrack=player.__track!==key,p=targetPos();
+  try{
+    applying=true;
+    if(newTrack){
+      player.__track=key;
+      lastPlayRequest=Date.now();
+      if(item.type==='playlist'){
+        const opts={listType:'playlist',list:item.id,index:0,startSeconds:p};
+        if(state.playing)player.loadPlaylist(opts);else player.cuePlaylist(opts);
+      }else{
+        const opts={videoId:item.id,startSeconds:p};
+        if(state.playing)player.loadVideoById(opts);else player.cueVideoById(opts);
+      }
+    }else if(state.playing){
+      const ps=player.getPlayerState();
+      if(ps===YT.PlayerState.PLAYING){
+        if(Math.abs((player.getCurrentTime()||0)-p)>1.35)player.seekTo(p,true);
+      }else if(ps===YT.PlayerState.PAUSED||ps===YT.PlayerState.CUED||ps===YT.PlayerState.UNSTARTED){
+        if(Date.now()-lastPlayRequest>1200){lastPlayRequest=Date.now();player.playVideo()}
+      }
+    }else{
+      if(Math.abs((player.getCurrentTime()||0)-p)>0.55&&!newTrack)player.seekTo(p,true);
+      if(player.getPlayerState()===YT.PlayerState.PLAYING)player.pauseVideo();
+    }
+  }catch(e){console.warn('Player error',e)}
+  setTimeout(()=>{applying=false},700);
+}
+
 window.onYouTubeIframeAPIReady=()=>{player=new YT.Player('yt',{height:'180',width:'320',playerVars:{playsinline:1,controls:0,origin:location.origin},events:{onReady:()=>{playerReady=true;applyPlayer()},onStateChange:e=>{if(!current())return;
+if(e.data===YT.PlayerState.PLAYING){$('playerNote').textContent='Playing · Music is synchronized across the room when browser playback is allowed.';}
 // Only the host decides when the next track begins. Listener ENDED events must never skip the room.
 if(host&&e.data===YT.PlayerState.ENDED&&Date.now()-lastAction>1100){hostAction('NEXT');return;}
 // Expand a YouTube playlist into actual video IDs when the iframe makes them available.
